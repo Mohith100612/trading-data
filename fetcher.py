@@ -10,11 +10,15 @@ Given a trading symbol, exchange, date range, and candle interval this module:
 from __future__ import annotations
 
 import sys
+import time
+import logging
 from datetime import datetime, date
 from typing import Union
 
 import pandas as pd
 from kiteconnect import KiteConnect
+
+logger = logging.getLogger(__name__)
 
 # Candle intervals supported by Kite Connect
 VALID_INTERVALS = {
@@ -33,6 +37,33 @@ INTERVAL_MAX_DAYS = {
     "60minute": 400,
     "day": 2000,
 }
+
+
+def _fetch_with_retry(fn, symbol: str, max_attempts: int = 3, backoff_seconds: int = 2):
+    """
+    Call fn(), retrying on failure with exponential backoff.
+
+    Wait schedule (base=2):  attempt 1 → 2s, attempt 2 → 4s, attempt 3 → give up.
+    """
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                wait = backoff_seconds * (2 ** attempt)
+                logger.warning(
+                    "Attempt %d/%d failed for %s: %s — retrying in %ds…",
+                    attempt + 1, max_attempts, symbol, exc, wait,
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    "All %d attempts exhausted for %s: %s",
+                    max_attempts, symbol, exc,
+                )
+    raise last_exc
 
 
 def lookup_instrument_token(
@@ -64,18 +95,19 @@ def lookup_instrument_token(
             for inst in instruments
             if symbol_upper in inst["tradingsymbol"].upper()
         ][:10]
-        hint = f"\n  Possible matches: {close}" if close else ""
-        sys.exit(
-            f"ERROR: Symbol '{symbol}' not found on {exchange}.{hint}\n"
+        hint = f" Possible matches: {close}" if close else ""
+        raise ValueError(
+            f"Symbol '{symbol}' not found on {exchange}.{hint} "
             f"Check the symbol name or try a different exchange (NSE, BSE, NFO, MCX)."
         )
 
     if len(matches) > 1:
-        print(
-            f"WARNING: Multiple instruments match '{symbol}' on {exchange}. "
-            f"Using the first: {matches[0]['tradingsymbol']} "
-            f"(token={matches[0]['instrument_token']}, "
-            f"name='{matches[0]['name']}')."
+        logger.warning(
+            "Multiple instruments match '%s' on %s. Using first: %s (token=%s, name='%s').",
+            symbol, exchange,
+            matches[0]["tradingsymbol"],
+            matches[0]["instrument_token"],
+            matches[0]["name"],
         )
 
     token: int = matches[0]["instrument_token"]
@@ -91,6 +123,8 @@ def fetch_historical_data(
     exchange: str = "NSE",
     continuous: bool = False,
     oi: bool = False,
+    max_attempts: int = 3,
+    backoff_seconds: int = 2,
 ) -> pd.DataFrame:
     """
     Fetch OHLCV candle data for a symbol and return a DataFrame.
@@ -112,8 +146,8 @@ def fetch_historical_data(
     """
     interval = interval.lower().strip()
     if interval not in VALID_INTERVALS:
-        sys.exit(
-            f"ERROR: Invalid interval '{interval}'. "
+        raise ValueError(
+            f"Invalid interval '{interval}'. "
             f"Choose from: {sorted(VALID_INTERVALS)}"
         )
 
@@ -122,36 +156,39 @@ def fetch_historical_data(
     to_dt   = _to_datetime(to_date,   is_start=False)
 
     if from_dt > to_dt:
-        sys.exit("ERROR: from_date must be earlier than to_date.")
+        raise ValueError("from_date must be earlier than to_date.")
 
     delta_days = (to_dt - from_dt).days
     max_days = INTERVAL_MAX_DAYS[interval]
     if delta_days > max_days:
-        print(
-            f"WARNING: The requested range ({delta_days} days) exceeds the "
-            f"Kite Connect limit of {max_days} days for '{interval}' candles. "
-            f"The API may return partial data or raise an error."
+        logger.warning(
+            "Requested range (%d days) exceeds Kite limit of %d days for '%s' candles.",
+            delta_days, max_days, interval,
         )
 
     instrument_token = lookup_instrument_token(kite, symbol, exchange)
 
-    print(
-        f"Fetching {interval} candles for {symbol} ({exchange}) "
-        f"from {from_dt.date()} to {to_dt.date()} "
-        f"[token={instrument_token}] …"
+    logger.info(
+        "Fetching %s candles for %s (%s) from %s to %s [token=%s].",
+        interval, symbol, exchange, from_dt.date(), to_dt.date(), instrument_token,
     )
 
-    records = kite.historical_data(
-        instrument_token=instrument_token,
-        from_date=from_dt,
-        to_date=to_dt,
-        interval=interval,
-        continuous=continuous,
-        oi=oi,
+    records = _fetch_with_retry(
+        lambda: kite.historical_data(
+            instrument_token=instrument_token,
+            from_date=from_dt,
+            to_date=to_dt,
+            interval=interval,
+            continuous=continuous,
+            oi=oi,
+        ),
+        symbol=symbol,
+        max_attempts=max_attempts,
+        backoff_seconds=backoff_seconds,
     )
 
     if not records:
-        print("No data returned for the given parameters.")
+        logger.warning("No data returned for %s (%s) %s — %s.", symbol, exchange, from_dt.date(), to_dt.date())
         return pd.DataFrame(), instrument_token
 
     df = pd.DataFrame(records)
@@ -159,7 +196,7 @@ def fetch_historical_data(
     df.set_index("date", inplace=True)
     df.sort_index(inplace=True)
 
-    print(f"Retrieved {len(df)} candles.")
+    logger.info("Retrieved %d candles for %s.", len(df), symbol)
     return df, instrument_token
 
 
@@ -185,5 +222,5 @@ def _to_datetime(value: Union[str, date, datetime], is_start: bool) -> datetime:
                 return dt
             except ValueError:
                 continue
-        sys.exit(f"ERROR: Cannot parse date '{value}'. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'.")
-    sys.exit(f"ERROR: Unsupported date type: {type(value)}")
+        raise ValueError(f"Cannot parse date '{value}'. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'.")
+    raise ValueError(f"Unsupported date type: {type(value)}")

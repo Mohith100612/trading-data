@@ -12,12 +12,14 @@ Step 2 — After Kite redirects you, copy the `request_token` from the URL and r
 This prints the access token and writes it to .env automatically.
 """
 
+import logging
 import os
 import sys
 import argparse
-import re
 from dotenv import load_dotenv, set_key
 from kiteconnect import KiteConnect
+
+logger = logging.getLogger(__name__)
 
 ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
 ENV_EXAMPLE = os.path.join(os.path.dirname(__file__), ".env.example")
@@ -55,11 +57,10 @@ def generate_session(request_token: str) -> str:
     # Persist to .env so subsequent runs don't need re-authentication
     if os.path.exists(ENV_FILE):
         set_key(ENV_FILE, "KITE_ACCESS_TOKEN", access_token)
-        print(f"Access token saved to {ENV_FILE}")
+        logger.info("Access token saved to %s", ENV_FILE)
     else:
-        print("WARNING: .env file not found — could not save access token.")
+        logger.warning(".env file not found — could not save access token.")
 
-    print(f"Access token: {access_token}")
     return access_token
 
 
@@ -109,4 +110,5 @@ if __name__ == "__main__":
             "  python auth.py --generate-session <request_token>\n"
         )
     elif args.generate_session:
-        generate_session(args.generate_session)
+        token = generate_session(args.generate_session)
+        print(f"Access token: {token}")
